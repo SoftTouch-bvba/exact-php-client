@@ -19,6 +19,11 @@ use GuzzleHttp\Psr7;
 class Connection
 {
     /**
+     * Limit of calls per minute.
+     */
+    const CALLS_LIMIT_PER_MINUTE = 60;
+
+    /**
      * @var string
      */
     private $baseUrl = 'https://start.exactonline.nl';
@@ -109,6 +114,36 @@ class Connection
     public $nextUrl = null;
 
     /**
+     * @var bool Pauses a request to make sure the calls per minute restriction is respected.
+     */
+    protected $pauseForMinuteLimit = false;
+
+    /**
+     * @var bool Pauses a request to make sure the calls are not made during maintenance.
+     */
+    protected $pauseForMaintenance = false;
+
+    /**
+     * @var int
+     */
+    private $callsLeft = self::CALLS_LIMIT_PER_MINUTE;
+
+    /**
+     * @var int The Unix timestamp at which the call's limit is lifted.
+     */
+    private $callsLimitResetAt = 0;
+
+    /**
+     * @var array Start time of the maintenance in array format [H, m, i].
+     */
+    private $startMaintenance = [4, 0, 0];
+
+    /**
+     * @var array End time of the maintenance in array format [H, m, i].
+     */
+    private $endMaintenance = [4, 30, 0];
+
+    /**
      * @return Client
      */
     private function client()
@@ -187,8 +222,121 @@ class Connection
 
         // Create the request
         $request = new Request($method, $endpoint, $headers, $body);
+\Illuminate\Support\Facades\Log::debug("request: $method, $endpoint, $body");
 
         return $request;
+    }
+
+    /**
+     * @return bool
+     */
+    public function isPauseForMinuteLimit()
+    {
+        return $this->pauseForMinuteLimit;
+    }
+
+    /**
+     * @param  bool
+     * @return self
+     */
+    public function setPauseForMinuteLimit($pauseForMinuteLimit)
+    {
+        $this->pauseForMinuteLimit = $pauseForMinuteLimit;
+
+        return $this;
+    }
+
+    /**
+     * @return bool
+     */
+    public function isPauseForMaintenance()
+    {
+        return $this->pauseForMaintenance;
+    }
+
+    /**
+     * @param  bool
+     * @return self
+     */
+    public function setPauseForMaintenance($pauseForMaintenance)
+    {
+        $this->pauseForMaintenance = $pauseForMaintenance;
+
+        return $this;
+    }
+
+    private function resetCallsLeft()
+    {
+        if ($this->callsLeft <= 0) {
+            return true;
+        }
+
+        if ($this->callsLimitResetAt === 0) {
+            return false;
+        }
+
+        if ($this->callsLeft > 0 && time() > $this->callsLimitResetAt) {
+            return true;
+        }
+
+        return false;
+    }
+
+    private function resetCallsLimitAt()
+    {
+        if ($this->callsLimitResetAt === 0) {
+            return true;
+        }
+
+        if ($this->callsLeft > 0 && time() <= $this->callsLimitResetAt) {
+            return false;
+        }
+
+        return true;
+    }
+
+    private function pause()
+    {
+\Illuminate\Support\Facades\Log::debug("start: $this->callsLeft, $this->callsLimitResetAt");
+        if ($this->isPauseForMinuteLimit() && $this->callsLeft <= 0) {
+            sleep(120);
+        }
+
+        if ($this->isPauseForMaintenance()) {
+            $startMaintenance = mktime(
+                $this->startMaintenance[0],
+                $this->startMaintenance[1],
+                $this->startMaintenance[2]
+            );
+
+            $endMaintenance = mktime(
+                $this->endMaintenance[0],
+                $this->endMaintenance[1],
+                $this->endMaintenance[2]
+            );
+
+            $now = time();
+
+            if ($now >= $startMaintenance && $now <= $endMaintenance) {
+                sleep($endMaintenance - $now);
+            }
+        }
+    }
+
+    private function setLimitVariables()
+    {
+        if ($this->isPauseForMinuteLimit()) {
+            if ($this->resetCallsLeft()) {
+                $this->callsLeft = self::CALLS_LIMIT_PER_MINUTE;
+            }
+
+            if ($this->resetCallsLimitAt()) {
+                $this->callsLimitResetAt = time() + 120;
+            }
+
+            $this->callsLeft--;
+        }
+\Illuminate\Support\Facades\Log::debug("end: $this->callsLeft, $this->callsLimitResetAt");
     }
 
     /**
@@ -202,6 +350,8 @@ class Connection
     {
         $url = $this->formatUrl($url, $url !== 'current/Me', $url == $this->nextUrl);
 
+        $this->pause();
+
         try {
             $request = $this->createRequest('GET', $url, null, $params, $headers);
             $response = $this->client()->send($request);
@@ -209,6 +359,8 @@ class Connection
             return $this->parseResponse($response, $url != $this->nextUrl);
         } catch (Exception $e) {
             $this->parseExceptionForErrorMessages($e);
+        } finally {
+            $this->setLimitVariables();
         }
         
         return null;
@@ -224,6 +376,8 @@ class Connection
     {
         $url = $this->formatUrl($url);
 
+        $this->pause();
+
         try {
             $request  = $this->createRequest('POST', $url, $body);
             $response = $this->client()->send($request);
@@ -231,6 +385,8 @@ class Connection
             return $this->parseResponse($response);
         } catch (Exception $e) {
             $this->parseExceptionForErrorMessages($e);
+        } finally {
+            $this->setLimitVariables();
         }
 
         return null;
@@ -246,6 +402,8 @@ class Connection
     {
         $url = $this->formatUrl($url);
 
+        $this->pause();
+
         try {
             $request  = $this->createRequest('PUT', $url, $body);
             $response = $this->client()->send($request);
@@ -253,6 +411,8 @@ class Connection
             return $this->parseResponse($response);
         } catch (Exception $e) {
             $this->parseExceptionForErrorMessages($e);
+        } finally {
+            $this->setLimitVariables();
         }
 
         return null;
@@ -267,6 +427,8 @@ class Connection
     {
         $url = $this->formatUrl($url);
 
+        $this->pause();
+
         try {
             $request  = $this->createRequest('DELETE', $url);
             $response = $this->client()->send($request);
@@ -274,6 +436,8 @@ class Connection
             return $this->parseResponse($response);
         } catch (Exception $e) {
             $this->parseExceptionForErrorMessages($e);
+        } finally {
+            $this->setLimitVariables();
         }
 
         return null;
@@ -429,6 +593,7 @@ class Connection
 
     private function acquireAccessToken()
     {
+\Illuminate\Support\Facades\Log::debug("before: $this->accessToken - $this->refreshToken");
         // If refresh token not yet acquired, do token request
         if (empty($this->refreshToken)) {
             $body = [
@@ -480,6 +645,7 @@ class Connection
                 call_user_func($this->acquireAccessTokenUnlockCallback, $this);
             }
         }
+\Illuminate\Support\Facades\Log::debug("after: $this->accessToken - $this->refreshToken");
     }
 
     /**
